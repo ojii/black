@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+import hashlib
 from asyncio.base_events import BaseEventLoop
 from concurrent.futures import Executor, ProcessPoolExecutor
 from enum import Enum
@@ -138,6 +139,9 @@ class WriteBack(Enum):
         "silence those with 2>/dev/null."
     ),
 )
+@click.option(
+    "-c", "--cache", is_flag=True, help="Cache already formatted files to .black-cache."
+)
 @click.version_option(version=__version__)
 @click.argument(
     "src",
@@ -154,10 +158,12 @@ def main(
     diff: bool,
     fast: bool,
     quiet: bool,
+    cache: bool,
     src: List[str],
 ) -> None:
     """The uncompromising code formatter."""
     sources: List[Path] = []
+
     for s in src:
         p = Path(s)
         if p.is_dir():
@@ -173,6 +179,11 @@ def main(
         exc = click.ClickException("Options --check and --diff are mutually exclusive")
         exc.exit_code = 2
         raise exc
+
+    if cache:
+        cache_filter = CacheFilter()
+    else:
+        cache_filter = NullFilter()
 
     if check:
         write_back = WriteBack.NO
@@ -192,9 +203,14 @@ def main(
                 )
             else:
                 changed = format_file_in_place(
-                    p, line_length=line_length, fast=fast, write_back=write_back
+                    p,
+                    line_length=line_length,
+                    fast=fast,
+                    write_back=write_back,
+                    cache_filter=cache_filter,
                 )
             report.done(p, changed)
+            cache_filter.write()
         except Exception as exc:
             report.failed(p, str(exc))
         ctx.exit(report.return_code)
@@ -205,12 +221,70 @@ def main(
         try:
             return_code = loop.run_until_complete(
                 schedule_formatting(
-                    sources, line_length, write_back, fast, quiet, loop, executor
+                    sources,
+                    line_length,
+                    write_back,
+                    fast,
+                    quiet,
+                    loop,
+                    executor,
+                    cache_filter,
                 )
             )
         finally:
+            cache_filter.write()
             shutdown(loop)
             ctx.exit(return_code)
+
+
+class NullFilter:
+
+    def already_formatted(self, path: Path, contents: str) -> bool:
+        return False
+
+    def post_formatting(self, path: Path, contents: str) -> None:
+        pass
+
+    def write(self) -> None:
+        pass
+
+
+class CacheFilter(NullFilter):
+
+    def __init__(self):
+        self.hashes: Dict[Path, str]
+        self.cache_file = Path.cwd() / ".cache" / "black" / "cache"
+        self.queue = Manager().Queue()
+        if self.cache_file.exists() and self.cache_file.is_file():
+            with self.cache_file.open("r") as fobj:
+                lines = (line.strip().split(" ", 1) for line in fobj if line.strip())
+                self.hashes = {Path(path): file_hash for file_hash, path in lines}
+        else:
+            self.hashes = {}
+
+    def post_formatting(self, path: Path, contents: str) -> None:
+        file_hash = hashlib.sha1(contents.encode("utf-8")).hexdigest()
+        self.queue.put((path, file_hash))
+
+    def already_formatted(self, path: Path, contents: str) -> bool:
+        if path not in self.hashes:
+            return False
+
+        return self.hashes[path] == hashlib.sha1(contents.encode("utf-8")).hexdigest()
+
+    def write(self) -> None:
+        while not self.queue.empty():
+            path, file_hash = self.queue.get()
+            self.hashes[path] = file_hash
+        parent = self.cache_file.parent
+        if not parent.exists():
+            parent.mkdir(parents=True)
+        with self.cache_file.open("w") as fobj:
+            fobj.write(
+                "\n".join(
+                    f"{file_hash} {path}" for path, file_hash in self.hashes.items()
+                )
+            )
 
 
 async def schedule_formatting(
@@ -221,6 +295,7 @@ async def schedule_formatting(
     quiet: bool,
     loop: BaseEventLoop,
     executor: Executor,
+    cache_filter: NullFilter,
 ) -> int:
     """Run formatting of `sources` in parallel using the provided `executor`.
 
@@ -237,7 +312,14 @@ async def schedule_formatting(
         lock = manager.Lock()
     tasks = {
         src: loop.run_in_executor(
-            executor, format_file_in_place, src, line_length, fast, write_back, lock
+            executor,
+            format_file_in_place,
+            src,
+            line_length,
+            fast,
+            cache_filter,
+            write_back,
+            lock,
         )
         for src in sources
     }
@@ -271,6 +353,7 @@ def format_file_in_place(
     src: Path,
     line_length: int,
     fast: bool,
+    cache_filter: NullFilter,
     write_back: WriteBack = WriteBack.NO,
     lock: Any = None,  # multiprocessing.Manager().Lock() is some crazy proxy
 ) -> bool:
@@ -281,16 +364,21 @@ def format_file_in_place(
     """
     with tokenize.open(src) as src_buffer:
         src_contents = src_buffer.read()
+    if cache_filter.already_formatted(src, src_contents):
+        return False
+
     try:
         dst_contents = format_file_contents(
             src_contents, line_length=line_length, fast=fast
         )
     except NothingChanged:
+        cache_filter.post_formatting(src, src_contents)
         return False
 
     if write_back == write_back.YES:
         with open(src, "w", encoding=src_buffer.encoding) as f:
             f.write(dst_contents)
+        cache_filter.post_formatting(src, dst_contents)
     elif write_back == write_back.DIFF:
         src_name = f"{src.name}  (original)"
         dst_name = f"{src.name}  (formatted)"

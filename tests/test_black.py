@@ -13,7 +13,12 @@ from click import unstyle
 import black
 
 ll = 88
-ff = partial(black.format_file_in_place, line_length=ll, fast=True)
+ff = partial(
+    black.format_file_in_place,
+    line_length=ll,
+    fast=True,
+    cache_filter=black.NullFilter(),
+)
 fs = partial(black.format_str, line_length=ll)
 THIS_FILE = Path(__file__)
 THIS_DIR = THIS_FILE.parent
