@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import struct
 from asyncio.base_events import BaseEventLoop
 from concurrent.futures import Executor, ProcessPoolExecutor
 from enum import Enum
@@ -28,8 +29,10 @@ from typing import (
     Type,
     TypeVar,
     Union,
+    FrozenSet,
 )
 
+from appdirs import user_cache_dir
 from attr import dataclass, Factory
 import click
 
@@ -41,6 +44,10 @@ from blib2to3.pgen2.parse import ParseError
 
 __version__ = "18.4a0"
 DEFAULT_LINE_LENGTH = 88
+MAX_CACHE_SIZE = 1 * 1024 * 1024
+CACHE_HEADER = struct.Struct("<3sB12x")
+CACHE_MAGIC_NUMBER = "黒".encode("utf-8")
+CACHE_VERSION = 0
 # types
 syms = pygram.python_symbols
 FileContent = str
@@ -181,9 +188,9 @@ def main(
         raise exc
 
     if cache:
-        cache_filter = CacheFilter()
+        cached = read_cache()
     else:
-        cache_filter = NullFilter()
+        cached = None
 
     if check:
         write_back = WriteBack.NO
@@ -202,15 +209,16 @@ def main(
                     line_length=line_length, fast=fast, write_back=write_back
                 )
             else:
-                changed = format_file_in_place(
+                changed, new_checksum = format_file_in_place(
                     p,
                     line_length=line_length,
                     fast=fast,
                     write_back=write_back,
-                    cache_filter=cache_filter,
+                    cached=cached,
                 )
+                if cache:
+                    write_cache({new_checksum})
             report.done(p, changed)
-            cache_filter.write()
         except Exception as exc:
             report.failed(p, str(exc))
         ctx.exit(report.return_code)
@@ -218,8 +226,9 @@ def main(
         loop = asyncio.get_event_loop()
         executor = ProcessPoolExecutor(max_workers=os.cpu_count())
         return_code = 1
+        new_checksums = set()
         try:
-            return_code = loop.run_until_complete(
+            return_code, new_checksums = loop.run_until_complete(
                 schedule_formatting(
                     sources,
                     line_length,
@@ -228,63 +237,82 @@ def main(
                     quiet,
                     loop,
                     executor,
-                    cache_filter,
+                    cached,
                 )
             )
         finally:
-            cache_filter.write()
+            if cache:
+                write_cache(new_checksums)
             shutdown(loop)
             ctx.exit(return_code)
 
 
-class NullFilter:
-
-    def already_formatted(self, path: Path, contents: str) -> bool:
-        return False
-
-    def post_formatting(self, path: Path, contents: str) -> None:
-        pass
-
-    def write(self) -> None:
-        pass
+class BrokenCache(Exception):
+    pass
 
 
-class CacheFilter(NullFilter):
+def get_cache_file() -> Path:
+    return Path(user_cache_dir("black")) / "already-formatted"
 
-    def __init__(self):
-        self.hashes: Dict[Path, str]
-        self.cache_file = Path.cwd() / ".cache" / "black" / "cache"
-        self.queue = Manager().Queue()
-        if self.cache_file.exists() and self.cache_file.is_file():
-            with self.cache_file.open("r") as fobj:
-                lines = (line.strip().split(" ", 1) for line in fobj if line.strip())
-                self.hashes = {Path(path): file_hash for file_hash, path in lines}
-        else:
-            self.hashes = {}
 
-    def post_formatting(self, path: Path, contents: str) -> None:
-        file_hash = hashlib.sha1(contents.encode("utf-8")).hexdigest()
-        self.queue.put((path, file_hash))
+def _read_cache() -> Iterable[bytes]:
+    path = get_cache_file()
+    if not path.exists():
+        return
 
-    def already_formatted(self, path: Path, contents: str) -> bool:
-        if path not in self.hashes:
-            return False
+    with path.open("rb") as fobj:
+        header = fobj.read(16)
+        magic, version = CACHE_HEADER.unpack(header)
+        if magic != CACHE_MAGIC_NUMBER:
+            return
 
-        return self.hashes[path] == hashlib.sha1(contents.encode("utf-8")).hexdigest()
+        if version != CACHE_VERSION:
+            return
 
-    def write(self) -> None:
-        while not self.queue.empty():
-            path, file_hash = self.queue.get()
-            self.hashes[path] = file_hash
-        parent = self.cache_file.parent
-        if not parent.exists():
-            parent.mkdir(parents=True)
-        with self.cache_file.open("w") as fobj:
-            fobj.write(
-                "\n".join(
-                    f"{file_hash} {path}" for path, file_hash in self.hashes.items()
-                )
-            )
+        while True:
+            checksum = fobj.read(20)
+            if not checksum:
+                break
+
+            if len(checksum) != 20:
+                raise BrokenCache()
+
+            yield checksum
+
+
+def read_cache() -> FrozenSet[bytes]:
+    try:
+        return frozenset(_read_cache())
+
+    except BrokenCache:
+        return frozenset()
+
+
+def write_cache(new_checksums: Set[bytes]):
+    if not new_checksums:
+        return
+
+    new_content = CACHE_HEADER.pack(CACHE_MAGIC_NUMBER, CACHE_VERSION) + b"".join(
+        new_checksums
+    )
+    old_content = b""
+    try:
+        for checksum in _read_cache():
+            if checksum not in new_checksums:
+                old_content += checksum
+    except BrokenCache:
+        old_content = b""
+    content = new_content + old_content
+    path = get_cache_file()
+    parent = path.parent
+    if not parent.exists():
+        parent.mkdir(parents=True)
+    with path.open("wb") as fobj:
+        fobj.write(content[:MAX_CACHE_SIZE])
+
+
+def get_checksum(contents: str) -> bytes:
+    return hashlib.sha1(contents.encode("utf-8")).digest()
 
 
 async def schedule_formatting(
@@ -295,8 +323,8 @@ async def schedule_formatting(
     quiet: bool,
     loop: BaseEventLoop,
     executor: Executor,
-    cache_filter: NullFilter,
-) -> int:
+    cached: Optional[FrozenSet[bytes]],
+) -> Tuple[int, Set[bytes]]:
     """Run formatting of `sources` in parallel using the provided `executor`.
 
     (Use ProcessPoolExecutors for actual parallelism.)
@@ -317,9 +345,9 @@ async def schedule_formatting(
             src,
             line_length,
             fast,
-            cache_filter,
             write_back,
             lock,
+            cached,
         )
         for src in sources
     }
@@ -328,6 +356,7 @@ async def schedule_formatting(
     loop.add_signal_handler(signal.SIGTERM, cancel, _task_values)
     await asyncio.wait(tasks.values())
     cancelled = []
+    new_checksums = set()
     report = Report(check=write_back is WriteBack.NO, quiet=quiet)
     for src, task in tasks.items():
         if not task.done():
@@ -339,24 +368,27 @@ async def schedule_formatting(
         elif task.exception():
             report.failed(src, str(task.exception()))
         else:
-            report.done(src, task.result())
+            changed, new_checksum = task.result()
+            if cached is not None:
+                new_checksums.add(new_checksum)
+            report.done(src, changed)
     if cancelled:
         await asyncio.gather(*cancelled, loop=loop, return_exceptions=True)
     elif not quiet:
         out("All done! ✨ 🍰 ✨")
     if not quiet:
         click.echo(str(report))
-    return report.return_code
+    return report.return_code, new_checksums
 
 
 def format_file_in_place(
     src: Path,
     line_length: int,
     fast: bool,
-    cache_filter: NullFilter,
     write_back: WriteBack = WriteBack.NO,
     lock: Any = None,  # multiprocessing.Manager().Lock() is some crazy proxy
-) -> bool:
+    cached: Optional[FrozenSet[bytes]] = None,
+) -> Tuple[bool, bytes]:
     """Format file under `src` path. Return True if changed.
 
     If `write_back` is True, write reformatted code back to stdout.
@@ -364,21 +396,22 @@ def format_file_in_place(
     """
     with tokenize.open(src) as src_buffer:
         src_contents = src_buffer.read()
-    if cache_filter.already_formatted(src, src_contents):
-        return False
+    src_checksum = get_checksum(src_contents)
+    if cached and src_checksum in cached:
+        return False, src_checksum
 
     try:
         dst_contents = format_file_contents(
             src_contents, line_length=line_length, fast=fast
         )
     except NothingChanged:
-        cache_filter.post_formatting(src, src_contents)
-        return False
+        return False, src_checksum
+
+    new_checksum = get_checksum(dst_contents)
 
     if write_back == write_back.YES:
         with open(src, "w", encoding=src_buffer.encoding) as f:
             f.write(dst_contents)
-        cache_filter.post_formatting(src, dst_contents)
     elif write_back == write_back.DIFF:
         src_name = f"{src.name}  (original)"
         dst_name = f"{src.name}  (formatted)"
@@ -390,7 +423,7 @@ def format_file_in_place(
         finally:
             if lock:
                 lock.release()
-    return True
+    return True, new_checksum
 
 
 def format_stdin_to_stdout(
