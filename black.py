@@ -9,6 +9,7 @@ from enum import Enum
 from functools import partial, wraps
 import keyword
 import logging
+from io import BufferedReader
 from multiprocessing import Manager
 import os
 from pathlib import Path
@@ -45,7 +46,7 @@ from blib2to3.pgen2.parse import ParseError
 __version__ = "18.4a0"
 DEFAULT_LINE_LENGTH = 88
 MAX_CACHE_SIZE = 1 * 1024 * 1024
-CACHE_HEADER = struct.Struct("<3sB12x")
+CACHE_HEADER = struct.Struct("<3sB12s")
 CACHE_MAGIC_NUMBER = "黒".encode("utf-8")
 CACHE_VERSION = 0
 # types
@@ -261,21 +262,25 @@ def _read_cache() -> Iterable[bytes]:
         return
 
     with path.open("rb") as fobj:
-        header = fobj.read(16)
-        magic, version = CACHE_HEADER.unpack(header)
+        reader = BufferedReader(fobj)
+        header = reader.read(16)
+        magic, cache_version, black_version = CACHE_HEADER.unpack(header)
         if magic != CACHE_MAGIC_NUMBER:
+            raise BrokenCache("Bad magic number")
+
+        if cache_version != CACHE_VERSION:
             return
 
-        if version != CACHE_VERSION:
+        if black_version != __version__:
             return
 
         while True:
-            checksum = fobj.read(20)
+            checksum = reader.read(20)
             if not checksum:
                 break
 
             if len(checksum) != 20:
-                raise BrokenCache()
+                raise BrokenCache(f"Bad entry at {reader.tell() - len(checksum)}")
 
             yield checksum
 
@@ -292,7 +297,9 @@ def write_cache(new_checksums: Set[bytes]):
     if not new_checksums:
         return
 
-    new_content = CACHE_HEADER.pack(CACHE_MAGIC_NUMBER, CACHE_VERSION) + b"".join(
+    new_content = CACHE_HEADER.pack(
+        CACHE_MAGIC_NUMBER, CACHE_VERSION, __version__
+    ) + b"".join(
         new_checksums
     )
     old_content = b""
