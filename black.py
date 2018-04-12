@@ -49,6 +49,7 @@ MAX_CACHE_SIZE = 1 * 1024 * 1024
 CACHE_HEADER = struct.Struct("<3sB12s")
 CACHE_MAGIC_NUMBER = "黒".encode("utf-8")
 CACHE_VERSION = 0
+BLACK_VERSION = struct.pack("<12s", __version__.encode("ascii"))
 # types
 syms = pygram.python_symbols
 FileContent = str
@@ -271,7 +272,7 @@ def _read_cache() -> Iterable[bytes]:
         if cache_version != CACHE_VERSION:
             return
 
-        if black_version != __version__:
+        if black_version != BLACK_VERSION:
             return
 
         while True:
