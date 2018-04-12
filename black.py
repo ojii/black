@@ -63,6 +63,7 @@ LN = Union[Leaf, Node]
 SplitFunc = Callable[["Line", bool], Iterator["Line"]]
 out = partial(click.secho, bold=True, err=True)
 err = partial(click.secho, fg="red", err=True)
+Fastcache = Dict[Path, Tuple[float, int]]
 
 
 class NothingChanged(UserWarning):
@@ -184,7 +185,8 @@ def main(
             sources.extend(gen_python_files_in_dir(p, fastcache))
         elif p.is_file():
             # if a file was explicitly given, we don't care about its extension
-            if p in fastcache and fastcache[p] == p.stat().st_mtime:
+            stat = p.stat()
+            if p in fastcache and fastcache[p] == (stat.st_mtime, stat.st_size):
                 continue
 
             sources.append(p)
@@ -218,7 +220,8 @@ def main(
                     p, line_length=line_length, fast=fast, write_back=write_back
                 )
                 if cache:
-                    write_fastcache({**fastcache, p: p.stat().st_mtime})
+                    stat = p.stat()
+                    write_fastcache({**fastcache, p: (stat.st_mtime, stat.st_size)})
             report.done(p, changed)
         except Exception as exc:
             report.failed(p, str(exc))
@@ -250,7 +253,7 @@ def get_fastcache_file() -> Path:
     return Path(user_cache_dir("black")) / "fastcache"
 
 
-def read_fastcache() -> Dict[Path, float]:
+def read_fastcache() -> Fastcache:
     path = get_fastcache_file()
     if not path.is_file():
         return {}
@@ -263,7 +266,7 @@ def read_fastcache() -> Dict[Path, float]:
     return fastcache
 
 
-def write_fastcache(fastcache: Dict[Path, float]):
+def write_fastcache(fastcache: Fastcache):
     path = get_fastcache_file()
     parent = path.parent
     if not parent.exists():
@@ -281,7 +284,7 @@ async def schedule_formatting(
     loop: BaseEventLoop,
     executor: Executor,
     cache: bool,
-    fastcache: Dict[Path, float],
+    fastcache: Fastcache,
 ) -> int:
     """Run formatting of `sources` in parallel using the provided `executor`.
 
@@ -320,7 +323,8 @@ async def schedule_formatting(
         else:
             changed = task.result()
             if cache:
-                fastcache[src] = src.stat().st_mtime
+                stat = src.stat()
+                fastcache[src] = (stat.st_mtime, stat.st_size)
             report.done(src, changed)
     if cancelled:
         await asyncio.gather(*cancelled, loop=loop, return_exceptions=True)
@@ -2046,7 +2050,7 @@ BLACKLISTED_DIRECTORIES = {
 }
 
 
-def gen_python_files_in_dir(path: Path, fastcache: Dict[Path, float]) -> Iterator[Path]:
+def gen_python_files_in_dir(path: Path, fastcache: Fastcache) -> Iterator[Path]:
     """Generate all files under `path` which aren't under BLACKLISTED_DIRECTORIES
     and have one of the PYTHON_EXTENSIONS.
     """
@@ -2058,7 +2062,8 @@ def gen_python_files_in_dir(path: Path, fastcache: Dict[Path, float]) -> Iterato
             yield from gen_python_files_in_dir(child, fastcache)
 
         elif child.suffix in PYTHON_EXTENSIONS:
-            if child in fastcache and fastcache[child] == child.stat().st_mtime:
+            stat = child.stat()
+            if child in fastcache and fastcache[child] == (stat.st_mtime, stat.st_size):
                 continue
 
             yield child
