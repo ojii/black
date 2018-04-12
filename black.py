@@ -64,6 +64,7 @@ LN = Union[Leaf, Node]
 SplitFunc = Callable[["Line", bool], Iterator["Line"]]
 out = partial(click.secho, bold=True, err=True)
 err = partial(click.secho, fg="red", err=True)
+Fastcache = Dict[Path, Tuple[float, int]]
 
 
 class NothingChanged(UserWarning):
@@ -185,7 +186,8 @@ def main(
             sources.extend(gen_python_files_in_dir(p, fastcache))
         elif p.is_file():
             # if a file was explicitly given, we don't care about its extension
-            if p in fastcache and fastcache[p] == p.stat().st_mtime:
+            stat = p.stat()
+            if p in fastcache and fastcache[p] == (stat.st_mtime, stat.st_size):
                 continue
 
             sources.append(p)
@@ -207,10 +209,6 @@ def main(
     if len(sources) == 0:
         ctx.exit(0)
     elif len(sources) == 1:
-        if cache:
-            cached = read_cache()
-        else:
-            cached = None
         p = sources[0]
         report = Report(check=check, quiet=quiet)
         try:
@@ -219,25 +217,17 @@ def main(
                     line_length=line_length, fast=fast, write_back=write_back
                 )
             else:
-                changed, new_checksum = format_file_in_place(
-                    p,
-                    line_length=line_length,
-                    fast=fast,
-                    write_back=write_back,
-                    cached=cached,
+                changed = format_file_in_place(
+                    p, line_length=line_length, fast=fast, write_back=write_back
                 )
                 if cache:
-                    write_cache({new_checksum})
-                    write_fastcache({**fastcache, p: p.stat().st_mtime})
+                    stat = p.stat()
+                    write_fastcache({**fastcache, p: (stat.st_mtime, stat.st_size)})
             report.done(p, changed)
         except Exception as exc:
             report.failed(p, str(exc))
         ctx.exit(report.return_code)
     else:
-        if cache:
-            cached = read_cache()
-        else:
-            cached = None
         loop = asyncio.get_event_loop()
         executor = ProcessPoolExecutor(max_workers=os.cpu_count())
         return_code = 1
@@ -251,7 +241,7 @@ def main(
                     quiet,
                     loop,
                     executor,
-                    cached,
+                    cache,
                     fastcache,
                 )
             )
@@ -309,7 +299,7 @@ def read_cache() -> FrozenSet[bytes]:
         return frozenset()
 
 
-def read_fastcache() -> Dict[Path, float]:
+def read_fastcache() -> Fastcache:
     path = get_fastcache_file()
     if not path.is_file():
         return {}
@@ -322,42 +312,13 @@ def read_fastcache() -> Dict[Path, float]:
     return fastcache
 
 
-def write_fastcache(fastcache: Dict[Path, float]):
+def write_fastcache(fastcache: Fastcache):
     path = get_fastcache_file()
     parent = path.parent
     if not parent.exists():
         parent.mkdir(parents=True)
     with path.open("wb") as fobj:
         pickle.dump((__version__, fastcache), fobj, pickle.HIGHEST_PROTOCOL)
-
-
-def write_cache(new_checksums: Set[bytes]):
-    if not new_checksums:
-        return
-
-    new_content = CACHE_HEADER.pack(
-        CACHE_MAGIC_NUMBER, CACHE_VERSION, __version__.encode("ascii")
-    ) + b"".join(
-        new_checksums
-    )
-    old_content = b""
-    try:
-        for checksum in _read_cache():
-            if checksum not in new_checksums:
-                old_content += checksum
-    except BrokenCache:
-        old_content = b""
-    content = new_content + old_content
-    path = get_cache_file()
-    parent = path.parent
-    if not parent.exists():
-        parent.mkdir(parents=True)
-    with path.open("wb") as fobj:
-        fobj.write(content[:MAX_CACHE_SIZE])
-
-
-def get_checksum(contents: str) -> bytes:
-    return hashlib.sha1(contents.encode("utf-8")).digest()
 
 
 async def schedule_formatting(
@@ -368,8 +329,8 @@ async def schedule_formatting(
     quiet: bool,
     loop: BaseEventLoop,
     executor: Executor,
-    cached: Optional[FrozenSet[bytes]],
-    fastcache: Dict[Path, float],
+    cache: bool,
+    fastcache: Fastcache,
 ) -> int:
     """Run formatting of `sources` in parallel using the provided `executor`.
 
@@ -386,14 +347,7 @@ async def schedule_formatting(
         lock = manager.Lock()
     tasks = {
         src: loop.run_in_executor(
-            executor,
-            format_file_in_place,
-            src,
-            line_length,
-            fast,
-            write_back,
-            lock,
-            cached,
+            executor, format_file_in_place, src, line_length, fast, write_back, lock
         )
         for src in sources
     }
@@ -402,8 +356,6 @@ async def schedule_formatting(
     loop.add_signal_handler(signal.SIGTERM, cancel, _task_values)
     await asyncio.wait(tasks.values())
     cancelled = []
-    new_checksums = set()
-    cache = cached is not None
     report = Report(check=write_back is WriteBack.NO, quiet=quiet)
     for src, task in tasks.items():
         if not task.done():
@@ -415,10 +367,10 @@ async def schedule_formatting(
         elif task.exception():
             report.failed(src, str(task.exception()))
         else:
-            changed, new_checksum = task.result()
+            changed = task.result()
             if cache:
-                new_checksums.add(new_checksum)
-                fastcache[src] = src.stat().st_mtime
+                stat = src.stat()
+                fastcache[src] = (stat.st_mtime, stat.st_size)
             report.done(src, changed)
     if cancelled:
         await asyncio.gather(*cancelled, loop=loop, return_exceptions=True)
@@ -427,8 +379,7 @@ async def schedule_formatting(
     if not quiet:
         click.echo(str(report))
     if cache:
-        write_cache(new_checksums)
-    write_fastcache(fastcache)
+        write_fastcache(fastcache)
     return report.return_code
 
 
@@ -438,8 +389,7 @@ def format_file_in_place(
     fast: bool,
     write_back: WriteBack = WriteBack.NO,
     lock: Any = None,  # multiprocessing.Manager().Lock() is some crazy proxy
-    cached: Optional[FrozenSet[bytes]] = None,
-) -> Tuple[bool, bytes]:
+) -> bool:
     """Format file under `src` path. Return True if changed.
 
     If `write_back` is True, write reformatted code back to stdout.
@@ -447,18 +397,13 @@ def format_file_in_place(
     """
     with tokenize.open(src) as src_buffer:
         src_contents = src_buffer.read()
-    src_checksum = get_checksum(src_contents)
-    if cached and src_checksum in cached:
-        return False, src_checksum
 
     try:
         dst_contents = format_file_contents(
             src_contents, line_length=line_length, fast=fast
         )
     except NothingChanged:
-        return False, src_checksum
-
-    new_checksum = get_checksum(dst_contents)
+        return False
 
     if write_back == write_back.YES:
         with open(src, "w", encoding=src_buffer.encoding) as f:
@@ -474,7 +419,7 @@ def format_file_in_place(
         finally:
             if lock:
                 lock.release()
-    return True, new_checksum
+    return True
 
 
 def format_stdin_to_stdout(
@@ -2151,7 +2096,7 @@ BLACKLISTED_DIRECTORIES = {
 }
 
 
-def gen_python_files_in_dir(path: Path, fastcache: Dict[Path, float]) -> Iterator[Path]:
+def gen_python_files_in_dir(path: Path, fastcache: Fastcache) -> Iterator[Path]:
     """Generate all files under `path` which aren't under BLACKLISTED_DIRECTORIES
     and have one of the PYTHON_EXTENSIONS.
     """
@@ -2163,7 +2108,8 @@ def gen_python_files_in_dir(path: Path, fastcache: Dict[Path, float]) -> Iterato
             yield from gen_python_files_in_dir(child, fastcache)
 
         elif child.suffix in PYTHON_EXTENSIONS:
-            if child in fastcache and fastcache[child] == child.stat().st_mtime:
+            stat = child.stat()
+            if child in fastcache and fastcache[child] == (stat.st_mtime, stat.st_size):
                 continue
 
             yield child
