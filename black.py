@@ -206,10 +206,6 @@ def main(
     if len(sources) == 0:
         ctx.exit(0)
     elif len(sources) == 1:
-        if cache:
-            cached = read_cache()
-        else:
-            cached = None
         p = sources[0]
         report = Report(check=check, quiet=quiet)
         try:
@@ -218,25 +214,16 @@ def main(
                     line_length=line_length, fast=fast, write_back=write_back
                 )
             else:
-                changed, new_checksum = format_file_in_place(
-                    p,
-                    line_length=line_length,
-                    fast=fast,
-                    write_back=write_back,
-                    cached=cached,
+                changed = format_file_in_place(
+                    p, line_length=line_length, fast=fast, write_back=write_back
                 )
                 if cache:
-                    write_cache({new_checksum})
                     write_fastcache({**fastcache, p: p.stat().st_mtime})
             report.done(p, changed)
         except Exception as exc:
             report.failed(p, str(exc))
         ctx.exit(report.return_code)
     else:
-        if cache:
-            cached = read_cache()
-        else:
-            cached = None
         loop = asyncio.get_event_loop()
         executor = ProcessPoolExecutor(max_workers=os.cpu_count())
         return_code = 1
@@ -250,7 +237,7 @@ def main(
                     quiet,
                     loop,
                     executor,
-                    cached,
+                    cache,
                     fastcache,
                 )
             )
@@ -259,53 +246,8 @@ def main(
             ctx.exit(return_code)
 
 
-class BrokenCache(Exception):
-    pass
-
-
-def get_cache_file() -> Path:
-    return Path(user_cache_dir("black")) / "already-formatted"
-
-
 def get_fastcache_file() -> Path:
     return Path(user_cache_dir("black")) / "fastcache"
-
-
-def _read_cache() -> Iterable[bytes]:
-    path = get_cache_file()
-    if not path.exists():
-        return
-
-    with path.open("rb") as fobj:
-        reader = BufferedReader(fobj)
-        header = reader.read(16)
-        magic, cache_version, black_version = CACHE_HEADER.unpack(header)
-        if magic != CACHE_MAGIC_NUMBER:
-            raise BrokenCache("Bad magic number")
-
-        if cache_version != CACHE_VERSION:
-            return
-
-        if black_version != __version__:
-            return
-
-        while True:
-            checksum = reader.read(20)
-            if not checksum:
-                break
-
-            if len(checksum) != 20:
-                raise BrokenCache(f"Bad entry at {reader.tell() - len(checksum)}")
-
-            yield checksum
-
-
-def read_cache() -> FrozenSet[bytes]:
-    try:
-        return frozenset(_read_cache())
-
-    except BrokenCache:
-        return frozenset()
 
 
 def read_fastcache() -> Dict[Path, float]:
@@ -330,35 +272,6 @@ def write_fastcache(fastcache: Dict[Path, float]):
         pickle.dump((__version__, fastcache), fobj, pickle.HIGHEST_PROTOCOL)
 
 
-def write_cache(new_checksums: Set[bytes]):
-    if not new_checksums:
-        return
-
-    new_content = CACHE_HEADER.pack(
-        CACHE_MAGIC_NUMBER, CACHE_VERSION, __version__.encode("ascii")
-    ) + b"".join(
-        new_checksums
-    )
-    old_content = b""
-    try:
-        for checksum in _read_cache():
-            if checksum not in new_checksums:
-                old_content += checksum
-    except BrokenCache:
-        old_content = b""
-    content = new_content + old_content
-    path = get_cache_file()
-    parent = path.parent
-    if not parent.exists():
-        parent.mkdir(parents=True)
-    with path.open("wb") as fobj:
-        fobj.write(content[:MAX_CACHE_SIZE])
-
-
-def get_checksum(contents: str) -> bytes:
-    return hashlib.sha1(contents.encode("utf-8")).digest()
-
-
 async def schedule_formatting(
     sources: List[Path],
     line_length: int,
@@ -367,7 +280,7 @@ async def schedule_formatting(
     quiet: bool,
     loop: BaseEventLoop,
     executor: Executor,
-    cached: Optional[FrozenSet[bytes]],
+    cache: bool,
     fastcache: Dict[Path, float],
 ) -> int:
     """Run formatting of `sources` in parallel using the provided `executor`.
@@ -385,14 +298,7 @@ async def schedule_formatting(
         lock = manager.Lock()
     tasks = {
         src: loop.run_in_executor(
-            executor,
-            format_file_in_place,
-            src,
-            line_length,
-            fast,
-            write_back,
-            lock,
-            cached,
+            executor, format_file_in_place, src, line_length, fast, write_back, lock
         )
         for src in sources
     }
@@ -401,8 +307,6 @@ async def schedule_formatting(
     loop.add_signal_handler(signal.SIGTERM, cancel, _task_values)
     await asyncio.wait(tasks.values())
     cancelled = []
-    new_checksums = set()
-    cache = cached is not None
     report = Report(check=write_back is WriteBack.NO, quiet=quiet)
     for src, task in tasks.items():
         if not task.done():
@@ -414,9 +318,8 @@ async def schedule_formatting(
         elif task.exception():
             report.failed(src, str(task.exception()))
         else:
-            changed, new_checksum = task.result()
+            changed = task.result()
             if cache:
-                new_checksums.add(new_checksum)
                 fastcache[src] = src.stat().st_mtime
             report.done(src, changed)
     if cancelled:
@@ -426,8 +329,7 @@ async def schedule_formatting(
     if not quiet:
         click.echo(str(report))
     if cache:
-        write_cache(new_checksums)
-    write_fastcache(fastcache)
+        write_fastcache(fastcache)
     return report.return_code
 
 
@@ -437,8 +339,7 @@ def format_file_in_place(
     fast: bool,
     write_back: WriteBack = WriteBack.NO,
     lock: Any = None,  # multiprocessing.Manager().Lock() is some crazy proxy
-    cached: Optional[FrozenSet[bytes]] = None,
-) -> Tuple[bool, bytes]:
+) -> bool:
     """Format file under `src` path. Return True if changed.
 
     If `write_back` is True, write reformatted code back to stdout.
@@ -446,18 +347,13 @@ def format_file_in_place(
     """
     with tokenize.open(src) as src_buffer:
         src_contents = src_buffer.read()
-    src_checksum = get_checksum(src_contents)
-    if cached and src_checksum in cached:
-        return False, src_checksum
 
     try:
         dst_contents = format_file_contents(
             src_contents, line_length=line_length, fast=fast
         )
     except NothingChanged:
-        return False, src_checksum
-
-    new_checksum = get_checksum(dst_contents)
+        return False
 
     if write_back == write_back.YES:
         with open(src, "w", encoding=src_buffer.encoding) as f:
@@ -473,7 +369,7 @@ def format_file_in_place(
         finally:
             if lock:
                 lock.release()
-    return True, new_checksum
+    return True
 
 
 def format_stdin_to_stdout(
