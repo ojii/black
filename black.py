@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import pickle
 import struct
 from asyncio.base_events import BaseEventLoop
 from concurrent.futures import Executor, ProcessPoolExecutor
@@ -172,12 +173,20 @@ def main(
     """The uncompromising code formatter."""
     sources: List[Path] = []
 
+    if cache:
+        fastcache = read_fastcache()
+    else:
+        fastcache = {}
+
     for s in src:
         p = Path(s)
         if p.is_dir():
-            sources.extend(gen_python_files_in_dir(p))
+            sources.extend(gen_python_files_in_dir(p, fastcache))
         elif p.is_file():
             # if a file was explicitly given, we don't care about its extension
+            if p in fastcache and fastcache[p] == p.stat().st_mtime:
+                continue
+
             sources.append(p)
         elif s == "-":
             sources.append(Path("-"))
@@ -188,11 +197,6 @@ def main(
         exc.exit_code = 2
         raise exc
 
-    if cache:
-        cached = read_cache()
-    else:
-        cached = None
-
     if check:
         write_back = WriteBack.NO
     elif diff:
@@ -202,6 +206,10 @@ def main(
     if len(sources) == 0:
         ctx.exit(0)
     elif len(sources) == 1:
+        if cache:
+            cached = read_cache()
+        else:
+            cached = None
         p = sources[0]
         report = Report(check=check, quiet=quiet)
         try:
@@ -219,17 +227,21 @@ def main(
                 )
                 if cache:
                     write_cache({new_checksum})
+                    write_fastcache({**fastcache, p: p.stat().st_mtime})
             report.done(p, changed)
         except Exception as exc:
             report.failed(p, str(exc))
         ctx.exit(report.return_code)
     else:
+        if cache:
+            cached = read_cache()
+        else:
+            cached = None
         loop = asyncio.get_event_loop()
         executor = ProcessPoolExecutor(max_workers=os.cpu_count())
         return_code = 1
-        new_checksums = set()
         try:
-            return_code, new_checksums = loop.run_until_complete(
+            return_code = loop.run_until_complete(
                 schedule_formatting(
                     sources,
                     line_length,
@@ -239,11 +251,10 @@ def main(
                     loop,
                     executor,
                     cached,
+                    fastcache,
                 )
             )
         finally:
-            if cache:
-                write_cache(new_checksums)
             shutdown(loop)
             ctx.exit(return_code)
 
@@ -254,6 +265,10 @@ class BrokenCache(Exception):
 
 def get_cache_file() -> Path:
     return Path(user_cache_dir("black")) / "already-formatted"
+
+
+def get_fastcache_file() -> Path:
+    return Path(user_cache_dir("black")) / "fastcache"
 
 
 def _read_cache() -> Iterable[bytes]:
@@ -293,12 +308,34 @@ def read_cache() -> FrozenSet[bytes]:
         return frozenset()
 
 
+def read_fastcache() -> Dict[Path, float]:
+    path = get_fastcache_file()
+    if not path.is_file():
+        return {}
+
+    with path.open("rb") as fobj:
+        version, fastcache = pickle.load(fobj)
+    if version != __version__:
+        return {}
+
+    return fastcache
+
+
+def write_fastcache(fastcache: Dict[Path, float]):
+    path = get_fastcache_file()
+    parent = path.parent
+    if not parent.exists():
+        parent.mkdir(parents=True)
+    with path.open("wb") as fobj:
+        pickle.dump((__version__, fastcache), fobj, pickle.HIGHEST_PROTOCOL)
+
+
 def write_cache(new_checksums: Set[bytes]):
     if not new_checksums:
         return
 
     new_content = CACHE_HEADER.pack(
-        CACHE_MAGIC_NUMBER, CACHE_VERSION, __version__
+        CACHE_MAGIC_NUMBER, CACHE_VERSION, __version__.encode("ascii")
     ) + b"".join(
         new_checksums
     )
@@ -331,7 +368,8 @@ async def schedule_formatting(
     loop: BaseEventLoop,
     executor: Executor,
     cached: Optional[FrozenSet[bytes]],
-) -> Tuple[int, Set[bytes]]:
+    fastcache: Dict[Path, float],
+) -> int:
     """Run formatting of `sources` in parallel using the provided `executor`.
 
     (Use ProcessPoolExecutors for actual parallelism.)
@@ -364,6 +402,7 @@ async def schedule_formatting(
     await asyncio.wait(tasks.values())
     cancelled = []
     new_checksums = set()
+    cache = cached is not None
     report = Report(check=write_back is WriteBack.NO, quiet=quiet)
     for src, task in tasks.items():
         if not task.done():
@@ -376,8 +415,9 @@ async def schedule_formatting(
             report.failed(src, str(task.exception()))
         else:
             changed, new_checksum = task.result()
-            if cached is not None:
+            if cache:
                 new_checksums.add(new_checksum)
+                fastcache[src] = src.stat().st_mtime
             report.done(src, changed)
     if cancelled:
         await asyncio.gather(*cancelled, loop=loop, return_exceptions=True)
@@ -385,7 +425,10 @@ async def schedule_formatting(
         out("All done! ✨ 🍰 ✨")
     if not quiet:
         click.echo(str(report))
-    return report.return_code, new_checksums
+    if cache:
+        write_cache(new_checksums)
+    write_fastcache(fastcache)
+    return report.return_code
 
 
 def format_file_in_place(
@@ -2107,7 +2150,7 @@ BLACKLISTED_DIRECTORIES = {
 }
 
 
-def gen_python_files_in_dir(path: Path) -> Iterator[Path]:
+def gen_python_files_in_dir(path: Path, fastcache: Dict[Path, float]) -> Iterator[Path]:
     """Generate all files under `path` which aren't under BLACKLISTED_DIRECTORIES
     and have one of the PYTHON_EXTENSIONS.
     """
@@ -2116,9 +2159,12 @@ def gen_python_files_in_dir(path: Path) -> Iterator[Path]:
             if child.name in BLACKLISTED_DIRECTORIES:
                 continue
 
-            yield from gen_python_files_in_dir(child)
+            yield from gen_python_files_in_dir(child, fastcache)
 
         elif child.suffix in PYTHON_EXTENSIONS:
+            if child in fastcache and fastcache[child] == child.stat().st_mtime:
+                continue
+
             yield child
 
 
